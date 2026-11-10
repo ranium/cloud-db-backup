@@ -80,6 +80,13 @@ return [
         'key' => env('BACKUP_S3_KEY'),
         'secret' => env('BACKUP_S3_SECRET'),
         'prefix' => trim((string) env('BACKUP_S3_PREFIX', 'db'), '/'),
+        // Any S3-compatible service: set its endpoint, e.g.
+        // https://blr1.digitaloceanspaces.com. Empty means AWS S3.
+        'endpoint' => env('BACKUP_S3_ENDPOINT'),
+        'use_path_style' => (bool) env('BACKUP_S3_USE_PATH_STYLE', false),
+        // AWS default. Set it empty for a provider that has no storage
+        // classes (DigitalOcean Spaces), and none is sent.
+        'storage_class' => env('BACKUP_S3_STORAGE_CLASS', 'STANDARD_IA'),
     ],
 
     'age' => [

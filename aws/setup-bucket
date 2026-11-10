@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+#
+# Creates or updates the offsite backup bucket described by a stack.json.
+#
+#   setup-bucket <stack.json> [--plan]
+#
+# provider "aws"            Deploys backup-bucket.yml with CloudFormation: the
+#                           bucket, its lifecycle rules, the upload-only IAM user
+#                           and the GitHub OIDC role. Uses your AWS CLI profile.
+#
+# provider "s3-compatible"  Any other S3-compatible service (DigitalOcean Spaces,
+#                           Backblaze B2, MinIO, ...). Creates the bucket if it is
+#                           missing, turns versioning on and applies the same
+#                           retention rules through the S3 API. Uses
+#                           AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY set to that
+#                           provider's keys. Access keys are created in the
+#                           provider's own console.
+#
+# --plan prints what would run and changes nothing.
+#
+# Needs: bash, jq, and the AWS CLI. Written for bash 3.2, so it runs on macOS.
+
+set -euo pipefail
+
+usage() {
+    echo "usage: $0 <stack.json> [--plan]" >&2
+    exit 2
+}
+
+[ $# -ge 1 ] || usage
+config="$1"
+plan=false
+[ "${2:-}" = "--plan" ] && plan=true
+[ -f "${config}" ] || { echo "setup-bucket: ${config} not found" >&2; exit 2; }
+
+for tool in jq aws; do
+    command -v "${tool}" >/dev/null || { echo "setup-bucket: ${tool} is required" >&2; exit 2; }
+done
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+field() {
+    # field <jq path> <default>
+    jq -r --arg default "$2" "($1) // \$default | tostring" "${config}"
+}
+
+provider="$(field .provider "")"
+region="$(field .region "")"
+bucket="$(field .bucket "")"
+endpoint="$(field .endpoint "")"
+daily_days="$(field .retention.daily_days 35)"
+monthly_days="$(field .retention.monthly_days 365)"
+noncurrent_days="$(field .retention.noncurrent_file_version_days 90)"
+
+fail() {
+    echo "setup-bucket: $*" >&2
+    exit 1
+}
+
+[ -n "${bucket}" ] || fail "\"bucket\" is required"
+[ -n "${region}" ] || fail "\"region\" is required"
+
+for days in "${daily_days}" "${monthly_days}" "${noncurrent_days}"; do
+    case "${days}" in
+        '' | *[!0-9]* | 0) fail "retention values must be whole numbers of days, at least 1 (got \"${days}\")" ;;
+    esac
+done
+
+# Standard-IA bills every object for at least 30 days; keeping one for less
+# costs the same as keeping it for 30.
+if [ "${provider}" = "aws" ] && [ "${daily_days}" -lt 30 ]; then
+    echo "setup-bucket: note: daily_days is ${daily_days}; S3 Standard-IA bills at least 30 days per object." >&2
+fi
+
+run() {
+    if ${plan}; then
+        printf '+'
+        printf ' %q' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+lifecycle_json() {
+    # lifecycle_json full|basic
+    jq -n \
+        --argjson daily "${daily_days}" \
+        --argjson monthly "${monthly_days}" \
+        --argjson noncurrent "${noncurrent_days}" \
+        --arg mode "$1" '
+        def expire(id; prefix; days): {
+            ID: id, Status: "Enabled", Filter: {Prefix: prefix},
+            Expiration: {Days: days}
+        } + (if $mode == "full" then {NoncurrentVersionExpiration: {NoncurrentDays: 1}} else {} end);
+        {Rules: (
+            [
+                expire("db-daily"; "db/daily/"; $daily),
+                expire("db-monthly"; "db/monthly/"; $monthly),
+                expire("db-manifests"; "db/manifests/"; $monthly),
+                {ID: "abort-incomplete-uploads", Status: "Enabled", Filter: {Prefix: ""},
+                 AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}}
+            ]
+            + (if $mode == "full" then [
+                {ID: "files-previous-versions", Status: "Enabled", Filter: {Prefix: "files/"},
+                 NoncurrentVersionExpiration: {NoncurrentDays: $noncurrent}},
+                {ID: "expired-delete-markers", Status: "Enabled", Filter: {Prefix: ""},
+                 Expiration: {ExpiredObjectDeleteMarker: true}}
+              ] else [] end)
+        )}'
+}
+
+setup_aws() {
+    local stack github_repository github_branch create_oidc
+    stack="$(field .stack_name offsite-backups)"
+    github_repository="$(field .github_repository "")"
+    github_branch="$(field .github_branch main)"
+    create_oidc="$(field .create_github_oidc_provider true)"
+
+    echo "Deploying CloudFormation stack \"${stack}\" in ${region} for bucket ${bucket}."
+
+    run aws cloudformation deploy \
+        --region "${region}" \
+        --stack-name "${stack}" \
+        --template-file "${here}/backup-bucket.yml" \
+        --capabilities CAPABILITY_IAM \
+        --no-fail-on-empty-changeset \
+        --parameter-overrides \
+        "BucketName=${bucket}" \
+        "DailyRetentionDays=${daily_days}" \
+        "MonthlyRetentionDays=${monthly_days}" \
+        "NoncurrentFileVersionDays=${noncurrent_days}" \
+        "GitHubRepository=${github_repository}" \
+        "GitHubBranch=${github_branch}" \
+        "CreateGitHubOidcProvider=${create_oidc}"
+
+    ${plan} && return
+
+    aws cloudformation describe-stacks --region "${region}" --stack-name "${stack}" \
+        --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
+
+    local user
+    user="$(aws cloudformation describe-stacks --region "${region}" --stack-name "${stack}" \
+        --query "Stacks[0].Outputs[?OutputKey=='DatabaseUploaderUserName'].OutputValue" --output text)"
+
+    cat <<EOF
+
+Next:
+  1. Create the database uploader's access key (once) and put it in each
+     cloud-db-backup deployment as BACKUP_S3_KEY / BACKUP_S3_SECRET:
+       aws iam create-access-key --user-name ${user}
+  2. Set the StorageSyncRoleArn output as the AWS_ROLE_ARN variable in this
+     config repository's GitHub settings.
+EOF
+}
+
+setup_s3_compatible() {
+    [ -n "${endpoint}" ] || fail "\"endpoint\" is required for provider \"s3-compatible\""
+
+    local s3api=(aws --endpoint-url "${endpoint}" --region "${region}" s3api)
+
+    echo "Setting up bucket ${bucket} at ${endpoint}."
+
+    if ${plan}; then
+        run "${s3api[@]}" create-bucket --bucket "${bucket}"
+    elif "${s3api[@]}" head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
+        echo "Bucket exists."
+    else
+        "${s3api[@]}" create-bucket --bucket "${bucket}" >/dev/null
+        echo "Bucket created."
+    fi
+
+    if ! run "${s3api[@]}" put-bucket-versioning --bucket "${bucket}" \
+        --versioning-configuration Status=Enabled; then
+        echo "WARNING: the provider refused versioning. Files deleted or replaced in a source bucket will not be recoverable from the mirror." >&2
+    fi
+
+    local rules
+    rules="$(mktemp)"
+    trap 'rm -f "${rules}"' RETURN
+
+    lifecycle_json full >"${rules}"
+    ${plan} && { echo "Lifecycle rules:"; cat "${rules}"; }
+
+    if run "${s3api[@]}" put-bucket-lifecycle-configuration --bucket "${bucket}" \
+        --lifecycle-configuration "file://${rules}"; then
+        echo "Retention rules applied."
+    else
+        echo "The provider rejected the full rule set; retrying without the rules for previous versions and delete markers." >&2
+        lifecycle_json basic >"${rules}"
+        run "${s3api[@]}" put-bucket-lifecycle-configuration --bucket "${bucket}" \
+            --lifecycle-configuration "file://${rules}"
+        echo "WARNING: old dumps expire, but previous versions of mirrored files are kept until you delete them, and they keep costing storage." >&2
+    fi
+
+    cat <<EOF
+
+Next (in the provider's console):
+  1. Create an access key limited to this bucket for the cloud-db-backup
+     deployments (BACKUP_S3_KEY / BACKUP_S3_SECRET, BACKUP_S3_ENDPOINT=${endpoint}).
+  2. Create one for the storage sync and store it as the DESTINATION_ACCESS_KEY_ID
+     and DESTINATION_SECRET_ACCESS_KEY secrets in this config repository.
+  Unlike AWS, most providers cannot issue a key that writes without being able
+  to delete, so treat these keys as able to remove backups.
+EOF
+}
+
+case "${provider}" in
+    aws) setup_aws ;;
+    s3-compatible) setup_s3_compatible ;;
+    *) fail "\"provider\" must be \"aws\" or \"s3-compatible\" (got \"${provider}\")" ;;
+esac

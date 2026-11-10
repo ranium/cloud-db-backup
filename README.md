@@ -50,46 +50,79 @@ db/monthly/<cluster>/<database>/YYYY/MM/<database>-<timestamp>.…             o
 db/manifests/<deployment>/YYYY/MM/DD/<timestamp>.json
 ```
 
-Retention is enforced by the bucket's lifecycle rules, not by this app; the
-app's credentials cannot delete anything.
+Retention is enforced by the bucket's lifecycle rules, not by this app. On AWS
+the app's credentials cannot delete anything.
+
+## Where backups can go
+
+Any S3-compatible bucket. **AWS S3** gets the full setup from a CloudFormation
+template: an upload-only IAM user (it can write dumps but never delete them)
+and a GitHub OIDC role for the storage sync, so no AWS key is stored in GitHub.
+**Other providers** (DigitalOcean Spaces, Backblaze B2, MinIO, ...) get the same
+bucket, versioning and retention rules through the S3 API; their access keys
+are created in the provider's console and can usually delete as well as write.
 
 ## Setup
 
-### 1. The bucket (once per AWS account)
+### 1. The bucket (once per account)
 
-```bash
-aws cloudformation deploy \
-  --region ap-south-1 \
-  --stack-name offsite-backups \
-  --template-file aws/backup-bucket.yml \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides \
-      BucketName=ranium-offsite-backups \
-      GitHubRepository=ranium/cloud-backups
+Describe it in a `stack.json` (keep this file in your private config
+repository, next to the storage sync's `buckets.yml`):
+
+```json
+{
+  "provider": "aws",
+  "region": "ap-south-1",
+  "bucket": "ranium-offsite-backups",
+  "stack_name": "offsite-backups",
+  "github_repository": "ranium/cloud-backups",
+  "retention": { "daily_days": 35, "monthly_days": 365, "noncurrent_file_version_days": 90 }
+}
 ```
 
-| Parameter | Default | |
+```json
+{
+  "provider": "s3-compatible",
+  "endpoint": "https://blr1.digitaloceanspaces.com",
+  "region": "blr1",
+  "bucket": "client-offsite-backups"
+}
+```
+
+Then run [`aws/setup-bucket`](aws/setup-bucket). `--plan` shows what it would do
+and changes nothing:
+
+```bash
+aws/setup-bucket stack.json --plan
+aws/setup-bucket stack.json
+```
+
+| `stack.json` field | Default | |
 |---|---|---|
-| `BucketName` | — | Globally unique. |
-| `DailyRetentionDays` | 35 | Days each daily dump is kept. |
-| `MonthlyRetentionDays` | 365 | Days each monthly dump and manifest is kept. |
-| `NoncurrentFileVersionDays` | 90 | Days a mirrored file's previous version is kept. |
-| `GitHubRepository` | empty | `owner/repo` of the storage config repo. Empty skips the storage role. |
-| `GitHubBranch` | `main` | Branch allowed to assume the storage role. |
-| `CreateGitHubOidcProvider` | `true` | Set `false` if the account already has GitHub's OIDC provider. |
+| `provider` | — | `aws` or `s3-compatible`. |
+| `region` | — | |
+| `bucket` | — | Globally unique on AWS. |
+| `endpoint` | — | `s3-compatible` only: the provider's S3 endpoint. |
+| `retention.daily_days` | 35 | Days each daily dump is kept. |
+| `retention.monthly_days` | 365 | Days each monthly dump and run manifest is kept. |
+| `retention.noncurrent_file_version_days` | 90 | Days a mirrored file's previous version is kept. |
+| `stack_name` | `offsite-backups` | `aws` only. |
+| `github_repository` | empty | `aws` only: `owner/repo` allowed to run the storage sync. Empty skips that role. |
+| `github_branch` | `main` | `aws` only. |
+| `create_github_oidc_provider` | `true` | `aws` only. `false` if the account already has GitHub's OIDC provider. |
 
-The bucket is versioned and encrypted at rest, blocks public access, and has
-**no Object Lock**: an account administrator can delete anything in it.
-Everything is stored in S3 Standard-IA, which bills each object for at least
-30 days and 128 KB.
+On AWS it deploys [`aws/backup-bucket.yml`](aws/backup-bucket.yml) with your
+AWS CLI profile. For other providers it uses `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` set to that provider's keys; if the provider rejects
+part of the retention rules, it applies what it can and says what is missing.
 
-Then create the uploader's access key and keep the output for step 3:
+Either way the bucket is versioned and encrypted at rest, and has **no Object
+Lock**: an account administrator can delete anything in it. On AWS everything
+is stored in S3 Standard-IA, which bills each object for at least 30 days and
+128 KB.
 
-```bash
-aws iam create-access-key --user-name "$(aws cloudformation describe-stacks \
-  --region ap-south-1 --stack-name offsite-backups \
-  --query "Stacks[0].Outputs[?OutputKey=='DatabaseUploaderUserName'].OutputValue" --output text)"
-```
+The script ends by printing the next steps, including the command that creates
+the uploader's access key on AWS.
 
 ### 2. An age key pair (once)
 
@@ -150,6 +183,9 @@ php artisan backup:databases --cluster=ranium-mysql-1
 | `BACKUP_CLUSTER_<NAME>_MAINTENANCE_DATABASE` | `postgres` | PostgreSQL: database used to list the others. |
 | `BACKUP_S3_BUCKET` / `_REGION` / `_KEY` / `_SECRET` | — | |
 | `BACKUP_S3_PREFIX` | `db` | |
+| `BACKUP_S3_ENDPOINT` | — | Set for any S3-compatible provider, e.g. `https://blr1.digitaloceanspaces.com`. Empty means AWS. |
+| `BACKUP_S3_USE_PATH_STYLE` | `false` | Some providers (MinIO) need path-style URLs. |
+| `BACKUP_S3_STORAGE_CLASS` | `STANDARD_IA` | Set empty for providers without storage classes, such as Spaces. |
 | `BACKUP_AGE_RECIPIENTS` | — | age public keys. |
 | `BACKUP_HEALTHCHECK_URL` | — | healthchecks.io ping URL. Unset means no pings. |
 | `BACKUP_SCHEDULE` | `30 21 * * *` | Cron, UTC. The default is 03:00 IST. |

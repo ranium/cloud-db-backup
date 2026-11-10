@@ -39,6 +39,44 @@ it('uploads to Standard-IA without sending an ACL', function () {
         ->and($sent[0]->hasParam('ACL'))->toBeFalse();
 });
 
+it('sends no storage class when none is configured', function () {
+    $handler = new MockHandler;
+    $sent = [];
+    $handler->append(function (CommandInterface $command) use (&$sent) {
+        $sent[] = $command;
+
+        return new Result([]);
+    });
+    $file = tempnam(sys_get_temp_dir(), 'up');
+
+    (new S3Uploader(mockS3($handler), 'spaces-bucket', null))->put($file, 'db/x');
+
+    expect($sent[0]->hasParam('StorageClass'))->toBeFalse();
+});
+
+it('talks to an S3-compatible endpoint when one is configured', function () {
+    config(['backup.s3' => [
+        'bucket' => 'client-backups', 'region' => 'blr1', 'key' => 'k', 'secret' => 's', 'prefix' => 'db',
+        'endpoint' => 'https://blr1.digitaloceanspaces.com', 'use_path_style' => false, 'storage_class' => '',
+    ]]);
+
+    $uploader = S3Uploader::fromConfig();
+    $client = (fn () => $this->client)->call($uploader);
+    $storageClass = (fn () => $this->storageClass)->call($uploader);
+
+    expect((string) $client->getEndpoint())->toBe('https://blr1.digitaloceanspaces.com')
+        ->and($storageClass)->toBeNull();
+});
+
+it('defaults to AWS and Standard-IA', function () {
+    config(['backup.s3' => ['bucket' => 'b', 'region' => 'ap-south-1', 'key' => 'k', 'secret' => 's', 'prefix' => 'db', 'storage_class' => 'STANDARD_IA']]);
+
+    $uploader = S3Uploader::fromConfig();
+
+    expect((string) (fn () => $this->client)->call($uploader)->getEndpoint())->toBe('https://s3.ap-south-1.amazonaws.com')
+        ->and((fn () => $this->storageClass)->call($uploader))->toBe('STANDARD_IA');
+});
+
 it('turns an S3 error into a backup failure', function () {
     $handler = new MockHandler;
     $handler->append(fn (CommandInterface $command) => new S3Exception('Access Denied', $command));

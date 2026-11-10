@@ -7,23 +7,26 @@ use Aws\S3\S3Client;
 use Throwable;
 
 /**
- * Uploads straight to S3 Standard-IA.
+ * Uploads to AWS S3 or any S3-compatible service (DigitalOcean Spaces,
+ * Cloudflare R2, Backblaze B2, MinIO…).
  *
- * Talks to the SDK directly, and never sends an ACL: the IAM user this runs as
- * may only write under its prefix (PutObject and the multipart calls), and the
- * bucket has ACLs disabled. The SDK's ObjectUploader always sends one, which
- * is why it is not used here.
+ * Talks to the SDK directly, and never sends an ACL: on AWS the IAM user this
+ * runs as may only write under its prefix (PutObject and the multipart calls),
+ * and the bucket has ACLs disabled. The SDK's ObjectUploader always sends one,
+ * which is why it is not used here.
  */
 final readonly class S3Uploader implements Uploader
 {
-    public const STORAGE_CLASS = 'STANDARD_IA';
-
     /** Above this, upload in parts. */
     public const MULTIPART_THRESHOLD = 64 * 1024 * 1024;
 
+    /**
+     * @param  string|null  $storageClass  Null sends no storage class at all.
+     */
     public function __construct(
         private S3Client $client,
         private string $bucket,
+        private ?string $storageClass = 'STANDARD_IA',
     ) {}
 
     public static function fromConfig(): self
@@ -36,21 +39,34 @@ final readonly class S3Uploader implements Uploader
             }
         }
 
-        return new self(new S3Client([
+        $client = [
             'version' => 'latest',
             'region' => $config['region'],
             'credentials' => ['key' => $config['key'], 'secret' => $config['secret']],
-        ]), $config['bucket']);
+        ];
+
+        if (filled($config['endpoint'] ?? null)) {
+            $client['endpoint'] = $config['endpoint'];
+            $client['use_path_style_endpoint'] = (bool) ($config['use_path_style'] ?? false);
+        }
+
+        return new self(
+            new S3Client($client),
+            $config['bucket'],
+            filled($config['storage_class'] ?? null) ? (string) $config['storage_class'] : null,
+        );
     }
 
     public function put(string $localPath, string $key): void
     {
+        $params = $this->storageClass !== null ? ['StorageClass' => $this->storageClass] : [];
+
         try {
             if ((int) filesize($localPath) > self::MULTIPART_THRESHOLD) {
                 (new MultipartUploader($this->client, $localPath, [
                     'bucket' => $this->bucket,
                     'key' => $key,
-                    'params' => ['StorageClass' => self::STORAGE_CLASS],
+                    'params' => $params,
                 ]))->upload();
 
                 return;
@@ -60,7 +76,7 @@ final readonly class S3Uploader implements Uploader
                 'Bucket' => $this->bucket,
                 'Key' => $key,
                 'SourceFile' => $localPath,
-                'StorageClass' => self::STORAGE_CLASS,
+                ...$params,
             ]);
         } catch (Throwable $exception) {
             throw new BackupException("Upload to s3://{$this->bucket}/{$key} failed: {$exception->getMessage()}", previous: $exception);

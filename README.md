@@ -170,3 +170,7 @@ See [RESTORE.md](RESTORE.md).
 composer install
 ./vendor/bin/pest
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

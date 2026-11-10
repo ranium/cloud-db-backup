@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Offsite backup bucket for Laravel Cloud database dumps (cloud-db-backup) and
+  R2 storage mirrors (cloud-storage-backup-action). Nothing here is immutable:
+  there is no Object Lock, and an account administrator can delete anything.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique name for the backup bucket.
+  DailyRetentionDays:
+    Type: Number
+    Default: 35
+    MinValue: 1
+    Description: Days to keep each daily database dump. Standard-IA bills at least 30 days per object.
+  MonthlyRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    Description: Days to keep each monthly database dump, and each run manifest.
+  NoncurrentFileVersionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: Days to keep the previous version of a mirrored file after it changes or is deleted in R2.
+  GitHubRepository:
+    Type: String
+    Default: ""
+    Description: >-
+      owner/repo of the private config repo whose workflow syncs storage, e.g.
+      ranium/cloud-backups. Leave empty to skip the storage sync role.
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Only workflows running on this branch may assume the storage sync role.
+  CreateGitHubOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      An AWS account can hold only one GitHub OIDC provider. Set "false" if
+      token.actions.githubusercontent.com is already registered in this account.
+
+Conditions:
+  HasGitHubRepository:
+    Fn::Not: [{ Fn::Equals: [{ Ref: GitHubRepository }, ""] }]
+  CreateOidcProvider:
+    Fn::And:
+      - { Condition: HasGitHubRepository }
+      - { Fn::Equals: [{ Ref: CreateGitHubOidcProvider }, "true"] }
+
+Resources:
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: { Ref: BucketName }
+      # Versioning keeps the previous copy of a mirrored file when the sync
+      # propagates a change or deletion. It is recoverability, not a lock.
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          # Each expired dump becomes a noncurrent version (the bucket is
+          # versioned); remove that a day later so it stops costing money.
+          - Id: db-daily
+            Status: Enabled
+            Prefix: db/daily/
+            ExpirationInDays: { Ref: DailyRetentionDays }
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+          - Id: db-monthly
+            Status: Enabled
+            Prefix: db/monthly/
+            ExpirationInDays: { Ref: MonthlyRetentionDays }
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+          - Id: db-manifests
+            Status: Enabled
+            Prefix: db/manifests/
+            ExpirationInDays: { Ref: MonthlyRetentionDays }
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+          # The mirror keeps every current file; only superseded or deleted
+          # versions expire.
+          - Id: files-previous-versions
+            Status: Enabled
+            Prefix: files/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: { Ref: NoncurrentFileVersionDays }
+          - Id: housekeeping
+            Status: Enabled
+            Prefix: ""
+            ExpiredObjectDeleteMarker: true
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # Used by every cloud-db-backup deployment in this account. Laravel Cloud
+  # cannot assume an IAM role, so this user gets an access key, created by
+  # hand after the stack (see Outputs) so the secret never sits in stack outputs.
+  # It can add dumps under db/ and do nothing else: no reading, no deleting.
+  DatabaseUploader:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: upload-database-dumps
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource:
+                  Fn::Sub: "arn:aws:s3:::${BackupBucket}/db/*"
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # Assumed by the config repo's workflow through GitHub's OIDC token, so no
+  # AWS key is stored in GitHub. It manages the mirror under files/: it can
+  # read, write and mark files deleted, but it cannot erase an old version.
+  StorageSyncRole:
+    Type: AWS::IAM::Role
+    Condition: HasGitHubRepository
+    Properties:
+      MaxSessionDuration: 43200
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated:
+                Fn::Sub: "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  Fn::Sub: "repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}"
+      Policies:
+        - PolicyName: sync-storage-mirror
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  Fn::Sub: "arn:aws:s3:::${BackupBucket}"
+                Condition:
+                  StringLike:
+                    s3:prefix: ["files/*"]
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                Resource:
+                  Fn::Sub: "arn:aws:s3:::${BackupBucket}/files/*"
+
+Outputs:
+  BucketName:
+    Value: { Ref: BackupBucket }
+  BucketRegion:
+    Value: { Ref: AWS::Region }
+  DatabaseUploaderUserName:
+    Description: Create its access key with `aws iam create-access-key --user-name <this>` and set it as BACKUP_S3_KEY / BACKUP_S3_SECRET.
+    Value: { Ref: DatabaseUploader }
+  StorageSyncRoleArn:
+    Condition: HasGitHubRepository
+    Description: Set as AWS_ROLE_ARN in the config repo.
+    Value:
+      Fn::GetAtt: [StorageSyncRole, Arn]

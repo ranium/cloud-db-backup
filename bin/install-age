@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# Installs the age encryption binary into .bin/ during the Laravel Cloud build.
+#
+# Both Linux architectures are fetched, because the machine that builds the app
+# is not guaranteed to match the one that runs it; the app picks the right one
+# at runtime (App\Backup\Age::architecture()). Every download is checked
+# against a pinned SHA-256 and the build fails on any mismatch.
+#
+# To upgrade age: bump AGE_VERSION and both checksums together.
+
+set -euo pipefail
+
+AGE_VERSION="v1.2.1"
+
+declare -A AGE_SHA256=(
+    [arm64]="57fd79a7ece5fe501f351b9dd51a82fbee1ea8db65a8839db17f5c080245e99f"
+    [amd64]="7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50"
+)
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+target="${root}/.bin"
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+
+mkdir -p "${target}"
+
+for arch in arm64 amd64; do
+    archive="${work}/age-${arch}.tar.gz"
+    curl -fsSL --retry 3 -o "${archive}" \
+        "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-linux-${arch}.tar.gz"
+
+    echo "${AGE_SHA256[$arch]}  ${archive}" | sha256sum --check --status || {
+        echo "install-age: checksum mismatch for ${arch}; refusing to install." >&2
+        exit 1
+    }
+
+    mkdir -p "${work}/${arch}"
+    tar -xzf "${archive}" -C "${work}/${arch}"
+    install -m 0755 "${work}/${arch}/age/age" "${target}/age-${arch}"
+done
+
+echo "install-age: installed age ${AGE_VERSION} for arm64 and amd64 in ${target}"

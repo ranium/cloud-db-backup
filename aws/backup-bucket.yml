@@ -41,6 +41,14 @@ Parameters:
     Type: String
     Default: main
     Description: Only workflows running on this branch may assume the storage sync role.
+  GitHubSubjectPrefix:
+    Type: String
+    Default: ""
+    Description: >-
+      The repository's OIDC subject prefix when it uses GitHub's immutable
+      subject format, e.g. repo:my-org@123/cloud-backups@456 (from
+      `gh api repos/<owner>/<repo>/actions/oidc/customization/sub`). Leave
+      empty for the classic repo:<owner>/<repo> format.
   CreateGitHubOidcProvider:
     Type: String
     Default: "true"
@@ -52,6 +60,8 @@ Parameters:
 Conditions:
   HasGitHubRepository:
     Fn::Not: [{ Fn::Equals: [{ Ref: GitHubRepository }, ""] }]
+  HasSubjectPrefix:
+    Fn::Not: [{ Fn::Equals: [{ Ref: GitHubSubjectPrefix }, ""] }]
   CreateOidcProvider:
     Fn::And:
       - { Condition: HasGitHubRepository }
@@ -167,7 +177,10 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
                 token.actions.githubusercontent.com:sub:
-                  Fn::Sub: "repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}"
+                  Fn::If:
+                    - HasSubjectPrefix
+                    - Fn::Sub: "${GitHubSubjectPrefix}:ref:refs/heads/${GitHubBranch}"
+                    - Fn::Sub: "repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}"
       Policies:
         - PolicyName: sync-storage-mirror
           PolicyDocument:

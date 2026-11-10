@@ -120,6 +120,7 @@ aws/setup-bucket stack.json
 | `stack_name` | `offsite-backups` | `aws` only. |
 | `github_repository` | empty | `aws` only: `owner/repo` allowed to run the storage sync. Empty skips that role. |
 | `github_branch` | `main` | `aws` only. |
+| `github_subject_prefix` | detected | `aws` only. Set when the repository uses GitHub's immutable OIDC subject format (`repo:owner@id/name@id`, the default for new repositories). With `gh` installed, `setup-bucket` detects it. |
 | `create_github_oidc_provider` | `true` | `aws` only. `false` if the account already has GitHub's OIDC provider. |
 
 On AWS it deploys [`aws/backup-bucket.yml`](aws/backup-bucket.yml) with your

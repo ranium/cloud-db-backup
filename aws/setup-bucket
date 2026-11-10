@@ -119,6 +119,27 @@ setup_aws() {
     github_repository="$(field .github_repository "")"
     github_branch="$(field .github_branch main)"
     create_oidc="$(field .create_github_oidc_provider true)"
+    subject_prefix="$(field .github_subject_prefix "")"
+
+    # Repositories can identify themselves to AWS by name
+    # (repo:owner/name) or, with GitHub's immutable subject format (the
+    # default for new repositories), by permanent ids
+    # (repo:owner@123/name@456). The role must trust the form the repository
+    # actually sends, so ask GitHub when stack.json does not say.
+    if [ -n "${github_repository}" ] && [ -z "${subject_prefix}" ] && command -v gh >/dev/null; then
+        if detected="$(gh api "repos/${github_repository}/actions/oidc/customization/sub" 2>/dev/null)"; then
+            if [ "$(jq -r '.use_immutable_subject // false' <<<"${detected}")" = "true" ]; then
+                subject_prefix="$(jq -r '.sub_claim_prefix // ""' <<<"${detected}")"
+            fi
+        fi
+    fi
+
+    if [ -n "${github_repository}" ]; then
+        echo "GitHub OIDC subject the role will trust: ${subject_prefix:-repo:${github_repository}}:ref:refs/heads/${github_branch}"
+        if [ -z "${subject_prefix}" ] && ! command -v gh >/dev/null; then
+            echo "  (gh is not installed, so the immutable subject format could not be checked; set github_subject_prefix in stack.json if the repository uses it)" >&2
+        fi
+    fi
 
     echo "Deploying CloudFormation stack \"${stack}\" in ${region} for bucket ${bucket}."
 
@@ -136,6 +157,7 @@ setup_aws() {
         "DumpVersionRecoveryDays=${dump_recovery_days}" \
         "GitHubRepository=${github_repository}" \
         "GitHubBranch=${github_branch}" \
+        "GitHubSubjectPrefix=${subject_prefix}" \
         "CreateGitHubOidcProvider=${create_oidc}"
 
     ${plan} && return

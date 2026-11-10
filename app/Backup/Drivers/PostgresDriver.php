@@ -53,15 +53,20 @@ final class PostgresDriver extends Driver
 
     public function dump(string $database, string $file): void
     {
+        // A bare --dbname containing "=" or starting "postgresql://" is read as
+        // a connection string, so always pass one, with the name quoted.
         $this->runOrFail("pg_dump of {$database}", [
-            'pg_dump', ...$this->connection(), '--format=custom', '--file='.$file, '--dbname='.$database,
+            'pg_dump', ...$this->connection(), '--format=custom', '--file='.$file,
+            "--dbname=dbname='".addcslashes($database, "'\\")."'",
         ], $this->env());
     }
 
     public function verify(string $file): void
     {
-        // pg_restore reads the whole table of contents; a truncated archive fails.
-        $this->runOrFail('Checking the dump with pg_restore --list', ['pg_restore', '--list', $file]);
+        // Restore to nowhere, which reads every byte of the archive. `--list`
+        // only reads the table of contents at the start and passes a
+        // truncated file.
+        $this->runOrFail('Checking the dump with pg_restore', ['pg_restore', '--file=/dev/null', $file]);
     }
 
     public function encrypt(string $file, string $encryptedFile, Age $age): void
@@ -106,6 +111,11 @@ final class PostgresDriver extends Driver
 
         if ($this->cluster->ssl !== null) {
             $env['PGSSLMODE'] = $this->cluster->ssl;
+
+            // verify-ca / verify-full need a CA; use the system's trust store.
+            if (str_starts_with($this->cluster->ssl, 'verify-')) {
+                $env['PGSSLROOTCERT'] = 'system';
+            }
         }
 
         return $env;

@@ -18,6 +18,14 @@ Parameters:
     Default: 365
     MinValue: 1
     Description: Days to keep each monthly database dump, and each run manifest.
+  DumpVersionRecoveryDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: >-
+      Days a database dump's previous version is kept after it is overwritten
+      or expires. The upload key cannot delete, but S3 lets PutObject replace
+      an object; this is the window in which a replaced dump can be recovered.
   NoncurrentFileVersionDays:
     Type: Number
     Default: 90
@@ -72,26 +80,27 @@ Resources:
           - ObjectOwnership: BucketOwnerEnforced
       LifecycleConfiguration:
         Rules:
-          # Each expired dump becomes a noncurrent version (the bucket is
-          # versioned); remove that a day later so it stops costing money.
+          # On a versioned bucket an expired or overwritten dump becomes a
+          # noncurrent version. Keep it DumpVersionRecoveryDays, so a dump
+          # replaced by a leaked upload key can still be recovered.
           - Id: db-daily
             Status: Enabled
             Prefix: db/daily/
             ExpirationInDays: { Ref: DailyRetentionDays }
             NoncurrentVersionExpiration:
-              NoncurrentDays: 1
+              NoncurrentDays: { Ref: DumpVersionRecoveryDays }
           - Id: db-monthly
             Status: Enabled
             Prefix: db/monthly/
             ExpirationInDays: { Ref: MonthlyRetentionDays }
             NoncurrentVersionExpiration:
-              NoncurrentDays: 1
+              NoncurrentDays: { Ref: DumpVersionRecoveryDays }
           - Id: db-manifests
             Status: Enabled
             Prefix: db/manifests/
             ExpirationInDays: { Ref: MonthlyRetentionDays }
             NoncurrentVersionExpiration:
-              NoncurrentDays: 1
+              NoncurrentDays: { Ref: DumpVersionRecoveryDays }
           # The mirror keeps every current file; only superseded or deleted
           # versions expire.
           - Id: files-previous-versions
@@ -109,7 +118,9 @@ Resources:
   # Used by every cloud-db-backup deployment in this account. Laravel Cloud
   # cannot assume an IAM role, so this user gets an access key, created by
   # hand after the stack (see Outputs) so the secret never sits in stack outputs.
-  # It can add dumps under db/ and do nothing else: no reading, no deleting.
+  # It can add dumps under db/ and nothing else: no reading, listing or
+  # deleting. S3 does let PutObject overwrite an existing key; the replaced
+  # version is then kept for DumpVersionRecoveryDays.
   DatabaseUploader:
     Type: AWS::IAM::User
     Properties:

@@ -90,3 +90,14 @@ it('names the missing setting', function () {
 
     S3Uploader::fromConfig();
 })->throws(BackupException::class, 'BACKUP_S3_KEY is not set.');
+
+it('keeps a multipart upload under the 10,000-part limit at any size', function (int $bytes) {
+    $part = S3Uploader::partSize($bytes);
+
+    expect($part)->toBeGreaterThanOrEqual(5 * 1024 * 1024)
+        ->and((int) ceil($bytes / $part))->toBeLessThanOrEqual(10000);
+})->with([
+    '65 MB' => 65 * 1024 * 1024,
+    '50 GB' => 50 * 1024 ** 3,
+    '400 GB' => 400 * 1024 ** 3,
+]);

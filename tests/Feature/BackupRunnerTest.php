@@ -278,3 +278,54 @@ it('runs from the console and exits non-zero on failure', function () {
     $driver->failingDumps = [];
     $this->artisan('backup:databases')->assertExitCode(0);
 });
+
+it('leaves nothing on disk when a database fails', function () {
+    $workDir = configureBackup(['main' => []]);
+    $driver = driverWith(['truncated', 'unencryptable']);
+    $driver->truncated = ['truncated'];
+    $uploader = new FakeUploader;
+    $uploader->failWhenKeyContains = 'unencryptable';
+
+    fakeRunner(new FakeDriverFactory(['main' => $driver]), $uploader)->run();
+
+    expect(glob($workDir.'/*'))->toBe([]);
+});
+
+it('removes the current dump when the run is abandoned mid-way', function () {
+    $workDir = configureBackup(['main' => []]);
+    $driver = driverWith(['app']);
+    $runner = fakeRunner(new FakeDriverFactory(['main' => $driver]), new FakeUploader);
+    $leftBehind = null;
+    $driver->afterDump = function (string $file) use ($runner, &$leftBehind) {
+        $leftBehind = file_exists($file);
+        $runner->abandon();
+    };
+
+    $runner->run();
+
+    expect($leftBehind)->toBeTrue()
+        ->and($driver->closed)->toBeTrue()
+        ->and(glob($workDir.'/*'))->toBe([]);
+});
+
+it('sweeps files a killed run left behind, but only old ones', function () {
+    $workDir = configureBackup(['main' => []]);
+    mkdir($workDir, 0700, true);
+    touch($stale = $workDir.'/main-app-abc.raw', time() - 90000);
+    touch($fresh = $workDir.'/my-other-run', time() - 60);
+
+    fakeRunner(new FakeDriverFactory(['main' => driverWith(['app'])]), new FakeUploader)->run();
+
+    expect(file_exists($stale))->toBeFalse()
+        ->and(file_exists($fresh))->toBeTrue();
+});
+
+it('still reports a failure when something outside a cluster breaks', function () {
+    configureBackup(['main' => []], ['backup.work_dir' => '/dev/null/not-a-directory']);
+
+    $report = fakeRunner(new FakeDriverFactory(['main' => driverWith(['app'])]), new FakeUploader, 'https://hc-ping.com/abc')->run();
+
+    expect($report->successful())->toBeFalse()
+        ->and($report->errors[0])->toStartWith('Unexpected error:');
+    Http::assertSent(fn (Request $request) => $request->url() === 'https://hc-ping.com/abc/fail');
+});

@@ -34,6 +34,28 @@ class BackupRunner
         private readonly Heartbeat $heartbeat,
     ) {}
 
+    /** The open driver session, closed by abandon() if the run is killed. */
+    private ?Driver $activeDriver = null;
+
+    /** @var list<string> Work files of the database being backed up right now. */
+    private array $inFlight = [];
+
+    /**
+     * Remove whatever the current run has on disk: called when the process is
+     * told to stop (SIGTERM on a deploy or restart), where `finally` blocks
+     * would otherwise never run and a plain dump would be left behind.
+     */
+    public function abandon(): void
+    {
+        foreach ($this->inFlight as $path) {
+            @unlink($path);
+        }
+
+        $this->inFlight = [];
+        $this->activeDriver?->close();
+        $this->activeDriver = null;
+    }
+
     /**
      * @param  list<string>  $only  Limit the run to these cluster names.
      * @param  bool  $dryRun  Connect and list databases; dump and upload nothing.
@@ -47,9 +69,12 @@ class BackupRunner
             $this->heartbeat->start();
         }
 
+        $results = [];
+        $errors = [];
+        $uploader = null;
+
         try {
             [$clusters, $errors] = $this->selectClusters($only);
-            $uploader = null;
 
             if (! $dryRun) {
                 $errors = [...$errors, ...$this->age->problems()];
@@ -61,23 +86,26 @@ class BackupRunner
                 }
             }
 
-            $results = [];
-
             if ($errors === []) {
                 $workDir = $this->workDir();
+                $this->sweepAbandonedFiles($workDir);
 
                 foreach ($clusters as $name => $config) {
                     $results[] = $this->backupCluster($name, $config, $workDir, $uploader, $startedAt);
                 }
             }
-
-            $report = new RunReport(config('backup.deployment'), $startedAt, CarbonImmutable::now('UTC'), $results, $errors, $dryRun);
-
-            if ($uploader !== null) {
-                $report = $this->writeManifest($report, $uploader);
-            }
+        } catch (Throwable $exception) {
+            // Anything not contained by a cluster or database still has to end
+            // as a failed report, so the healthcheck hears about it.
+            $errors[] = 'Unexpected error: '.$exception->getMessage();
         } finally {
             umask($previousUmask);
+        }
+
+        $report = new RunReport(config('backup.deployment'), $startedAt, CarbonImmutable::now('UTC'), $results, $errors, $dryRun);
+
+        if ($uploader !== null) {
+            $report = $this->writeManifest($report, $uploader);
         }
 
         $report->successful() ? Log::info($report->summary()) : Log::error($report->summary());
@@ -128,7 +156,7 @@ class BackupRunner
         $driver = null;
 
         try {
-            $driver = $this->drivers->make($cluster, $workDir, (int) config('backup.dump_timeout_seconds'));
+            $driver = $this->activeDriver = $this->drivers->make($cluster, $workDir, (int) config('backup.dump_timeout_seconds'));
 
             $unreachable = $this->waitUntilReachable($driver);
 
@@ -155,6 +183,7 @@ class BackupRunner
             return new ClusterResult($name, $cluster->driver, $databases, $exception->getMessage());
         } finally {
             $driver?->close();
+            $this->activeDriver = null;
         }
     }
 
@@ -188,6 +217,7 @@ class BackupRunner
         $base = $workDir.'/'.Str::slug($cluster->name.'-'.$database).'-'.Str::random(8);
         $plain = $base.'.raw';
         $encrypted = $base.'.'.$driver->extension();
+        $this->inFlight = [$plain, $encrypted];
 
         try {
             $driver->dump($database, $plain);
@@ -214,6 +244,7 @@ class BackupRunner
         } finally {
             @unlink($plain);
             @unlink($encrypted);
+            $this->inFlight = [];
         }
     }
 
@@ -247,9 +278,10 @@ class BackupRunner
             $report->startedAt->format('Ymd\THis\Z'),
         );
 
-        $path = $this->workDir().'/manifest-'.Str::random(8).'.json';
+        $path = null;
 
         try {
+            $path = $this->workDir().'/manifest-'.Str::random(8).'.json';
             file_put_contents($path, json_encode($report->toArray(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
             $uploader->put($path, $key);
 
@@ -263,7 +295,26 @@ class BackupRunner
                 [...$report->errors, 'Could not upload the run manifest: '.$exception->getMessage()],
             );
         } finally {
-            @unlink($path);
+            if ($path !== null) {
+                @unlink($path);
+            }
+        }
+    }
+
+    /**
+     * A run that is killed outright (a deploy, an out-of-memory kill, an
+     * instance restart) never reaches its `finally` blocks, and leaves plain
+     * dumps and credential files behind. Remove anything older than a day: no
+     * live run is ever that old, so this cannot touch a run in progress.
+     */
+    private function sweepAbandonedFiles(string $workDir): void
+    {
+        $cutoff = time() - 86400;
+
+        foreach (glob($workDir.'/*') ?: [] as $path) {
+            if (is_file($path) && (int) filemtime($path) < $cutoff) {
+                @unlink($path);
+            }
         }
     }
 

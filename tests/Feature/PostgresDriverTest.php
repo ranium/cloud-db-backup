@@ -55,13 +55,30 @@ it('dumps in the custom format', function () {
     Process::assertRan(fn (PendingProcess $process) => $process->command[0] === 'pg_dump'
         && in_array('--format=custom', $process->command, true)
         && in_array('--file=/tmp/kognit.raw', $process->command, true)
-        && in_array('--dbname=kognit', $process->command, true));
+        && in_array("--dbname=dbname='kognit'", $process->command, true));
 });
 
-it('verifies a dump by reading its table of contents', function () {
+it('quotes a database name so it can never be read as a connection string', function () {
+    Process::fake();
+
+    (new PostgresDriver(pgCluster(), pgTempDir(), 60))->dump("host=evil dbname=other o'brien", '/tmp/x.raw');
+
+    Process::assertRan(fn (PendingProcess $process) => in_array("--dbname=dbname='host=evil dbname=other o\\'brien'", $process->command, true));
+});
+
+it('trusts the system CA store when the certificate must be verified', function () {
+    Process::fake();
+
+    (new PostgresDriver(pgCluster(['ssl' => 'verify-full']), pgTempDir(), 60))->ping();
+
+    Process::assertRan(fn (PendingProcess $process) => $process->environment['PGSSLMODE'] === 'verify-full'
+        && $process->environment['PGSSLROOTCERT'] === 'system');
+});
+
+it('verifies a dump by reading all of it, not just its table of contents', function () {
     Process::fake();
 
     (new PostgresDriver(pgCluster(), pgTempDir(), 60))->verify('/tmp/kognit.raw');
 
-    Process::assertRan(fn (PendingProcess $process) => $process->command === ['pg_restore', '--list', '/tmp/kognit.raw']);
+    Process::assertRan(fn (PendingProcess $process) => $process->command === ['pg_restore', '--file=/dev/null', '/tmp/kognit.raw']);
 });

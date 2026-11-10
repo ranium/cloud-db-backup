@@ -119,9 +119,14 @@ final class MysqlDriver extends Driver
      */
     private function client(string $binary): array
     {
-        $command = [$binary, '--defaults-extra-file='.$this->defaultsFile];
+        // utf8mb4 explicitly: with a utf8mb3 client default, 4-byte characters
+        // (emoji) would come back as "?" and the dump would still verify.
+        $command = [$binary, '--defaults-extra-file='.$this->defaultsFile, '--default-character-set=utf8mb4'];
 
-        if (filter_var($this->cluster->ssl, FILTER_VALIDATE_BOOLEAN)) {
+        if ($this->cluster->ssl === 'verify') {
+            $command[] = '--ssl';
+            $command[] = '--ssl-verify-server-cert';
+        } elseif (filter_var($this->cluster->ssl, FILTER_VALIDATE_BOOLEAN)) {
             $command[] = '--ssl';
         }
 

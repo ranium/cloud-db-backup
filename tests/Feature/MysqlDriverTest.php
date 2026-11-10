@@ -88,12 +88,23 @@ it('reports a failed dump with the client error', function () {
     (new MysqlDriver(mysqlCluster(), tempDir(), 60))->dump('app', '/tmp/out.raw');
 })->throws(BackupException::class, 'mysqldump of app failed (exit 2): mysqldump: Got error: 1045: Access denied');
 
-it('adds --ssl when the cluster asks for it', function () {
+it('always asks for utf8mb4, so 4-byte characters survive', function () {
+    Process::fake();
+
+    (new MysqlDriver(mysqlCluster(), tempDir(), 60))->dump('app', '/tmp/out.raw');
+
+    Process::assertRan(fn (PendingProcess $process) => $process->command[2] === '--default-character-set=utf8mb4');
+});
+
+it('adds --ssl when the cluster asks for it, and verifies the certificate on "verify"', function () {
     Process::fake();
 
     (new MysqlDriver(mysqlCluster(['ssl' => 'true']), tempDir(), 60))->ping();
+    (new MysqlDriver(mysqlCluster(['name' => 'strict', 'ssl' => 'verify']), tempDir(), 60))->ping();
 
-    Process::assertRan(fn (PendingProcess $process) => $process->command[2] === '--ssl');
+    Process::assertRan(fn (PendingProcess $process) => in_array('--ssl', $process->command, true)
+        && ! in_array('--ssl-verify-server-cert', $process->command, true));
+    Process::assertRan(fn (PendingProcess $process) => in_array('--ssl-verify-server-cert', $process->command, true));
 });
 
 it('accepts a complete dump and rejects a truncated or empty one', function () {

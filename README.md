@@ -39,7 +39,14 @@ cluster never stops the others. Every run writes a JSON manifest and, if
 configured, pings healthchecks.io with the outcome.
 
 Passwords are passed to the database clients through private (0600) files
-that are deleted after use, never on a command line.
+that are deleted after use, never on a command line. If the process is told to
+stop mid-run (Laravel Cloud sends SIGTERM before replacing an instance), it
+removes its plain dump and credential files first; anything a hard kill leaves
+behind is swept by the next run once it is a day old.
+
+Results go to the app's log (Laravel Cloud: **Monitoring → Logs**, application
+logs) and to the manifest. **Set `BACKUP_HEALTHCHECK_URL`**: it is optional, but
+it is the only thing that tells you when a nightly run fails, or never ran.
 
 ### S3 layout
 
@@ -51,12 +58,15 @@ db/manifests/<deployment>/YYYY/MM/DD/<timestamp>.json
 ```
 
 Retention is enforced by the bucket's lifecycle rules, not by this app. On AWS
-the app's credentials cannot delete anything.
+the app's credentials cannot read, list or delete anything. S3 does let a
+write replace an existing object, so the bucket keeps a replaced or expired
+dump as a previous version for `dump_version_recovery_days` (7 by default):
+a leaked key could overwrite backups, but not beyond recovery within that window.
 
 ## Where backups can go
 
 Any S3-compatible bucket. **AWS S3** gets the full setup from a CloudFormation
-template: an upload-only IAM user (it can write dumps but never delete them)
+template: an upload-only IAM user (it can write dumps but not read or delete them)
 and a GitHub OIDC role for the storage sync, so no AWS key is stored in GitHub.
 **Other providers** (DigitalOcean Spaces, Backblaze B2, MinIO, ...) get the same
 bucket, versioning and retention rules through the S3 API; their access keys
@@ -106,6 +116,7 @@ aws/setup-bucket stack.json
 | `retention.daily_days` | 35 | Days each daily dump is kept. |
 | `retention.monthly_days` | 365 | Days each monthly dump and run manifest is kept. |
 | `retention.noncurrent_file_version_days` | 90 | Days a mirrored file's previous version is kept. |
+| `retention.dump_version_recovery_days` | 7 | Days a replaced or expired dump is kept as a previous version. |
 | `stack_name` | `offsite-backups` | `aws` only. |
 | `github_repository` | empty | `aws` only: `owner/repo` allowed to run the storage sync. Empty skips that role. |
 | `github_branch` | `main` | `aws` only. |
@@ -148,8 +159,11 @@ then on its environment:
 - **Environment variables:** everything in `.env.example`, with passwords and
   the S3 secret stored as secrets.
 - **Instance:** the smallest size, exactly one replica, **scheduler on**.
-- **Hibernation off.** A hibernating environment does not run its scheduler,
-  so no backups would happen.
+- **Scale to zero:** Cloud wakes a sleeping environment for its scheduled
+  tasks, but it stays awake only for the sleep timeout. Leave scale to zero
+  off unless a full run (including waiting for suspended clusters, up to
+  `BACKUP_WAKE_TIMEOUT` each) reliably finishes well inside that timeout.
+- **Logs:** leave `LOG_CHANNEL` unset; Cloud collects the app's logs itself.
 - **No database attached.** The app connects to clusters through its own
   variables. Use a cluster's private hostname when it is in the same region.
 
@@ -179,7 +193,7 @@ php artisan backup:databases --cluster=ranium-mysql-1
 | `BACKUP_CLUSTER_<NAME>_PASSWORD` | — | |
 | `BACKUP_CLUSTER_<NAME>_INCLUDE` | — | Only these databases. |
 | `BACKUP_CLUSTER_<NAME>_EXCLUDE` | — | Skip these databases. |
-| `BACKUP_CLUSTER_<NAME>_SSL` | — | MySQL: `true` adds `--ssl`. PostgreSQL: a libpq `sslmode`. |
+| `BACKUP_CLUSTER_<NAME>_SSL` | — | MySQL: `true` encrypts, `verify` also checks the server certificate. PostgreSQL: a libpq `sslmode`; `verify-full` checks the certificate against the system CA store. Use a verifying mode for any cluster reached over the internet. |
 | `BACKUP_CLUSTER_<NAME>_MAINTENANCE_DATABASE` | `postgres` | PostgreSQL: database used to list the others. |
 | `BACKUP_S3_BUCKET` / `_REGION` / `_KEY` / `_SECRET` | — | |
 | `BACKUP_S3_PREFIX` | `db` | |
@@ -187,10 +201,13 @@ php artisan backup:databases --cluster=ranium-mysql-1
 | `BACKUP_S3_USE_PATH_STYLE` | `false` | Some providers (MinIO) need path-style URLs. |
 | `BACKUP_S3_STORAGE_CLASS` | `STANDARD_IA` | Set empty for providers without storage classes, such as Spaces. |
 | `BACKUP_AGE_RECIPIENTS` | — | age public keys. |
-| `BACKUP_HEALTHCHECK_URL` | — | healthchecks.io ping URL. Unset means no pings. |
+| `BACKUP_HEALTHCHECK_URL` | — | healthchecks.io ping URL. Unset means no pings. Strongly recommended. |
 | `BACKUP_SCHEDULE` | `30 21 * * *` | Cron, UTC. The default is 03:00 IST. |
 | `BACKUP_WAKE_TIMEOUT` | 300 | Seconds to wait for a suspended cluster. |
+| `BACKUP_WAKE_RETRY` | 10 | Seconds between connection attempts while a cluster wakes. |
 | `BACKUP_DUMP_TIMEOUT` | 3600 | Seconds allowed per dump. |
+| `BACKUP_WORK_DIR` | `storage/app/backup-work` | Where dumps are staged before upload. |
+| `BACKUP_AGE_BINARY` | `.bin/age-<arch>` | Path to age, if not installed by `bin/install-age`. |
 | `BACKUP_MONTHLY_DAY` | 1 | Day of month whose dump is also kept as the monthly copy. |
 
 `<NAME>` is the cluster name upper-cased with each run of non-alphanumerics

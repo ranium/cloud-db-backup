@@ -48,6 +48,11 @@ final readonly class S3Uploader implements Uploader
         if (filled($config['endpoint'] ?? null)) {
             $client['endpoint'] = $config['endpoint'];
             $client['use_path_style_endpoint'] = (bool) ($config['use_path_style'] ?? false);
+            // Recent SDKs add CRC checksum headers to every upload, which
+            // several S3-compatible providers reject. Send them only when the
+            // operation requires one.
+            $client['request_checksum_calculation'] = 'when_required';
+            $client['response_checksum_validation'] = 'when_required';
         }
 
         return new self(
@@ -62,11 +67,14 @@ final readonly class S3Uploader implements Uploader
         $params = $this->storageClass !== null ? ['StorageClass' => $this->storageClass] : [];
 
         try {
-            if ((int) filesize($localPath) > self::MULTIPART_THRESHOLD) {
+            $size = (int) filesize($localPath);
+
+            if ($size > self::MULTIPART_THRESHOLD) {
                 (new MultipartUploader($this->client, $localPath, [
                     'bucket' => $this->bucket,
                     'key' => $key,
                     'params' => $params,
+                    'part_size' => self::partSize($size),
                 ]))->upload();
 
                 return;
@@ -81,5 +89,15 @@ final readonly class S3Uploader implements Uploader
         } catch (Throwable $exception) {
             throw new BackupException("Upload to s3://{$this->bucket}/{$key} failed: {$exception->getMessage()}", previous: $exception);
         }
+    }
+
+    /**
+     * S3 allows at most 10,000 parts per upload, of at least 5 MiB each.
+     * 16 MiB parts cover dumps up to ~150 GiB; beyond that the parts grow so
+     * the count stays under the limit, with headroom.
+     */
+    public static function partSize(int $bytes): int
+    {
+        return max(16 * 1024 * 1024, (int) ceil($bytes / 9000));
     }
 }

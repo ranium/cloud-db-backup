@@ -15,6 +15,18 @@ class BackupDatabases extends Command
 {
     public function handle(BackupRunner $runner): int
     {
+        // Laravel Cloud sends SIGTERM before replacing an instance (deploys,
+        // scaling, maintenance). Remove this run's plain dump and credential
+        // files before exiting, since `finally` blocks will not get to.
+        if (extension_loaded('pcntl')) {
+            $this->trap([SIGTERM, SIGINT], function () use ($runner): never {
+                $runner->abandon();
+                $this->error('Interrupted: this run\'s temporary files were removed. The next run starts over.');
+
+                exit(self::FAILURE);
+            });
+        }
+
         $report = $runner->run($this->option('cluster'), (bool) $this->option('dry-run'));
 
         $rows = [];

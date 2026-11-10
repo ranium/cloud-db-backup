@@ -2,7 +2,12 @@
 
 You need: the age **private key** (from your password manager), read access to
 the backup bucket, and the `age`, `gunzip` and `mysql` (or `pg_restore`)
-command-line tools.
+command-line tools. PostgreSQL archives are written by pg_dump 18, so restore
+them with **pg_restore 18 or newer**.
+
+What a dump contains: one database's schema and data, plus its routines,
+triggers and events (MySQL). It does **not** contain users, roles or grants;
+recreate those on the target first.
 
 ## 1. Find the dump
 
@@ -43,7 +48,9 @@ age -d -i offsite-backups.agekey laratix_production-20261114T213000Z.sql.gz.age 
 ```
 
 The dump has no `CREATE DATABASE` or `USE` statement, so it restores into
-whichever database you name.
+whichever database you name. Routines, triggers and views carry the
+`DEFINER` of the original user; restoring them needs a user with
+`SET_USER_ID` (or `SUPER`), or the original user to exist on the target.
 
 ### PostgreSQL (`.dump.age`)
 

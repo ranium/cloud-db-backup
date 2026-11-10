@@ -40,8 +40,9 @@ done
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 field() {
-    # field <jq path> <default>
-    jq -r --arg default "$2" "($1) // \$default | tostring" "${config}"
+    # field <jq path> <default>. Only a missing or null value takes the
+    # default: jq's `//` would also replace an explicit false.
+    jq -r --arg default "$2" "if ($1) == null then \$default else ($1) end | tostring" "${config}"
 }
 
 provider="$(field .provider "")"
@@ -51,6 +52,7 @@ endpoint="$(field .endpoint "")"
 daily_days="$(field .retention.daily_days 35)"
 monthly_days="$(field .retention.monthly_days 365)"
 noncurrent_days="$(field .retention.noncurrent_file_version_days 90)"
+dump_recovery_days="$(field .retention.dump_version_recovery_days 7)"
 
 fail() {
     echo "setup-bucket: $*" >&2
@@ -60,7 +62,7 @@ fail() {
 [ -n "${bucket}" ] || fail "\"bucket\" is required"
 [ -n "${region}" ] || fail "\"region\" is required"
 
-for days in "${daily_days}" "${monthly_days}" "${noncurrent_days}"; do
+for days in "${daily_days}" "${monthly_days}" "${noncurrent_days}" "${dump_recovery_days}"; do
     case "${days}" in
         '' | *[!0-9]* | 0) fail "retention values must be whole numbers of days, at least 1 (got \"${days}\")" ;;
     esac
@@ -88,11 +90,12 @@ lifecycle_json() {
         --argjson daily "${daily_days}" \
         --argjson monthly "${monthly_days}" \
         --argjson noncurrent "${noncurrent_days}" \
+        --argjson recovery "${dump_recovery_days}" \
         --arg mode "$1" '
         def expire(id; prefix; days): {
             ID: id, Status: "Enabled", Filter: {Prefix: prefix},
             Expiration: {Days: days}
-        } + (if $mode == "full" then {NoncurrentVersionExpiration: {NoncurrentDays: 1}} else {} end);
+        } + (if $mode == "full" then {NoncurrentVersionExpiration: {NoncurrentDays: $recovery}} else {} end);
         {Rules: (
             [
                 expire("db-daily"; "db/daily/"; $daily),
@@ -130,6 +133,7 @@ setup_aws() {
         "DailyRetentionDays=${daily_days}" \
         "MonthlyRetentionDays=${monthly_days}" \
         "NoncurrentFileVersionDays=${noncurrent_days}" \
+        "DumpVersionRecoveryDays=${dump_recovery_days}" \
         "GitHubRepository=${github_repository}" \
         "GitHubBranch=${github_branch}" \
         "CreateGitHubOidcProvider=${create_oidc}"
@@ -190,7 +194,9 @@ setup_s3_compatible() {
         lifecycle_json basic >"${rules}"
         run "${s3api[@]}" put-bucket-lifecycle-configuration --bucket "${bucket}" \
             --lifecycle-configuration "file://${rules}"
-        echo "WARNING: old dumps expire, but previous versions of mirrored files are kept until you delete them, and they keep costing storage." >&2
+        echo "WARNING: the provider did not accept rules for previous versions. On a versioned bucket, expired dumps and" >&2
+        echo "         replaced or deleted mirrored files are then kept as previous versions until you delete them, and keep" >&2
+        echo "         costing storage. Set a rule for noncurrent versions in the provider's console if it offers one." >&2
     fi
 
     cat <<EOF

@@ -34,6 +34,9 @@ final class FakeDriver extends Driver
 
     public ?string $listError = null;
 
+    /** Runs after a dump is written, e.g. to simulate the process being killed. */
+    public ?\Closure $afterDump = null;
+
     public function __construct(?ClusterConfig $cluster = null, string $workDir = '', int $timeoutSeconds = 0)
     {
         if ($cluster !== null) {
@@ -70,6 +73,10 @@ final class FakeDriver extends Driver
 
         $this->dumped[] = $database;
         file_put_contents($file, in_array($database, $this->truncated, true) ? 'TRUNCATED' : "dump of {$database}");
+
+        if ($this->afterDump !== null) {
+            ($this->afterDump)($file);
+        }
     }
 
     public function verify(string $file): void

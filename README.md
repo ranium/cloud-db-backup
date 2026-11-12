@@ -86,7 +86,7 @@ On the machine you run the setup from (macOS or Linux):
 | `bash`, `curl` | everything | built in |
 | `jq` | `aws/setup-bucket` | `brew install jq` |
 | AWS CLI (`aws`) | `aws/setup-bucket`, every provider (it speaks the S3 API, also to Spaces) | `brew install awscli` |
-| `doctl` | provider `digitalocean` | `brew install doctl` |
+| `doctl` (1.x or 2.x) | provider `digitalocean` | `brew install doctl` |
 | GitHub CLI (`gh`) | provider `digitalocean` (stores the storage sync's key); `aws` (detects the OIDC subject format) | `brew install gh` |
 | Laravel Cloud CLI (`cloud`) | provider `digitalocean` with `--db-key`; reading cluster details | see [the Cloud docs](https://cloud.laravel.com/docs) |
 | `age` | making the encryption key pair, and restoring | `brew install age` |
@@ -166,8 +166,10 @@ what is missing.
 On `digitalocean`, DigitalOcean's API (and so `doctl`) manages Spaces keys but
 not buckets, so the script:
 
-1. creates a temporary full-access Spaces key with `doctl`, which it deletes
-   again when it exits, however it exits;
+1. creates a temporary full-access Spaces key with `doctl`, and deletes it when
+   it exits, on success or failure (if that delete fails, or the script is
+   killed outright, it prints, or you run, `doctl spaces keys list` to find
+   the `setup-bucket-temporary-…` key and delete it);
 2. with that key and the AWS CLI, creates the bucket, turns versioning on and
    applies the retention rules;
 3. creates the storage sync's key, `<bucket>-storage-sync`, limited to this
@@ -177,7 +179,7 @@ not buckets, so the script:
 Once a deployment exists (step 3 below), give it the database key:
 
 ```bash
-aws/setup-bucket stack.json --db-key <environment id>
+aws/setup-bucket stack.json --db-key <environment id or name>
 ```
 
 The first time, this creates `<bucket>-db-backup`, limited to this bucket, and

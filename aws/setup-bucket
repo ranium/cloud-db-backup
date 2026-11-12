@@ -71,17 +71,27 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # however the script exits.
 work="$(mktemp -d)"
 doctl=(doctl)
+temp_name=""
 temp_key=""
 cleanup() {
-    rm -rf "${work}"
+    # A temporary key may exist without its id having been read back (the
+    # script stopped mid-create): find it by its unique name.
+    if [ -z "${temp_key}" ] && [ -n "${temp_name}" ]; then
+        if ! temp_key="$(spaces_key_access "${temp_name}" 2>/dev/null)"; then
+            temp_key=""
+            echo "WARNING: could not check whether the temporary full-access Spaces key ${temp_name} exists." >&2
+            echo "         Look for it with: ${doctl[*]} spaces keys list" >&2
+        fi
+    fi
     if [ -n "${temp_key}" ]; then
-        if "${doctl[@]}" spaces keys delete "${temp_key}" --force >/dev/null 2>&1; then
+        if delete_spaces_key "${temp_key}"; then
             echo "Temporary Spaces key deleted."
         else
             echo "WARNING: could not delete the temporary full-access Spaces key ${temp_key}. Delete it now:" >&2
             echo "         ${doctl[*]} spaces keys delete ${temp_key}" >&2
         fi
     fi
+    rm -rf "${work}"
 }
 trap cleanup EXIT
 
@@ -298,22 +308,54 @@ EOF
 # A Spaces key is either full-access (every bucket in the team) or limited to
 # named buckets with "read" or "readwrite"; readwrite can also delete.
 
+# doctl_flag <flag> <command words...>: prints the flag if that doctl command
+# has it. doctl 1.x and 2.x differ: 1.x asks before deleting unless given
+# --force; 2.x has no --force, never asks, and masks secrets unless given --show.
+doctl_flag() {
+    local flag="$1" help
+    shift
+    help="$("${doctl[@]}" "$@" --help 2>/dev/null || true)"
+    case "${help}" in
+        *"${flag}"*) printf '%s' "${flag}" ;;
+    esac
+}
+
 # spaces_key_access <name>: the access key id of the Spaces key with that
-# name, or nothing.
+# name, or nothing. Names are not unique in Spaces; more than one is an error.
 spaces_key_access() {
     local keys
     keys="$("${doctl[@]}" spaces keys list -o json)" || fail "doctl could not list Spaces keys"
-    jq -r --arg name "$1" 'if type == "array" then . else [] end | map(select(.name == $name)) | .[0].access_key // empty' <<<"${keys}"
+    jq -r --arg name "$1" '
+        if . == null then [] else . end
+        | map(select(.name == $name))
+        | if length > 1 then error("several keys share the name") else (.[0].access_key // empty) end' <<<"${keys}" \
+        || fail "more than one Spaces key is named \"$1\", or doctl's output was unexpected. Check: ${doctl[*]} spaces keys list"
+}
+
+# delete_spaces_key <access key>
+delete_spaces_key() {
+    local force
+    force="$(doctl_flag --force spaces keys delete)"
+    "${doctl[@]}" spaces keys delete "$1" ${force:+"${force}"} </dev/null >/dev/null 2>&1
 }
 
 # create_spaces_key <name> <grants>: creates the key and leaves its id and
-# secret in ${work}/key.json, readable only by this user.
+# secret in ${work}/key.json, readable only by this user. A secret that comes
+# back masked or missing is never stored anywhere: the key is deleted again.
 create_spaces_key() {
-    (umask 077 && "${doctl[@]}" spaces keys create "$1" --grants "$2" -o json \
+    local show access secret
+    show="$(doctl_flag --show spaces keys create)"
+    (umask 077 && "${doctl[@]}" spaces keys create "$1" --grants "$2" ${show:+"${show}"} -o json \
         | jq 'if type == "array" then .[0] else . end | {access_key, secret_key}' >"${work}/key.json") \
-        || fail "doctl could not create the Spaces key \"$1\""
-    [ -n "$(jq -r '.access_key // empty' "${work}/key.json")" ] && [ -n "$(jq -r '.secret_key // empty' "${work}/key.json")" ] \
-        || fail "doctl did not return the new Spaces key \"$1\""
+        || fail "doctl could not create the Spaces key \"$1\", or returned something unexpected. Check for it with: ${doctl[*]} spaces keys list"
+    access="$(jq -r '.access_key // empty' "${work}/key.json")"
+    secret="$(jq -r '.secret_key // empty' "${work}/key.json")"
+    if [ -z "${access}" ] || [ ${#secret} -lt 20 ] || [ "${secret}" != "${secret#*\*}" ]; then
+        if [ -n "${access}" ] && ! delete_spaces_key "${access}"; then
+            echo "WARNING: delete the Spaces key ${access}: ${doctl[*]} spaces keys delete ${access}" >&2
+        fi
+        fail "doctl did not return the new Spaces key \"$1\" in full (its secret was missing or masked); nothing was stored."
+    fi
 }
 
 key_field() {
@@ -366,16 +408,23 @@ setup_sync_key() {
         && key_field secret_key | gh secret set DESTINATION_SECRET_ACCESS_KEY -R "${repository}" >/dev/null; then
         echo "Storage sync key \"${name}\" created and stored as ${repository}'s DESTINATION_* secrets."
     else
-        "${doctl[@]}" spaces keys delete "$(key_field access_key)" --force >/dev/null 2>&1 || true
+        local access
+        access="$(key_field access_key)"
         gh secret delete DESTINATION_ACCESS_KEY_ID -R "${repository}" >/dev/null 2>&1 || true
-        fail "could not store the storage sync key in ${repository}, so the key was deleted again. Check gh's access and run this again."
+        delete_spaces_key "${access}" \
+            || fail "could not store the storage sync key in ${repository}, nor delete it again. Delete it (${doctl[*]} spaces keys delete ${access}) and any DESTINATION_* secret in ${repository}, then run this again."
+        fail "could not store the storage sync key in ${repository}; the key was deleted again. Check gh's access and run this again."
     fi
     rm -f "${work}/key.json"
 }
 
-# cloud_secret_id <secrets json> <name>
+# cloud_secret_id <secrets json> <name>: the id of the Laravel Cloud secret
+# with that name, or nothing. More than one is an error.
 cloud_secret_id() {
-    jq -r --arg name "$2" '[.[]? | select(.key == $name)] | .[0].id // empty | tostring' <<<"$1"
+    jq -r --arg name "$2" '
+        map(select(.key == $name))
+        | if length > 1 then error("several secrets share the name") else (.[0].id // empty | tostring) end' <<<"$1" \
+        || fail "more than one Laravel Cloud secret is named $2, or cloud's output was unexpected. Check: cloud secret:list"
 }
 
 # The database apps' key: one per bucket, shared by every cloud-db-backup
@@ -417,11 +466,20 @@ setup_db_key() {
             && [ -n "${secret_id}" ]; then
             echo "Database key \"${name}\" created and stored as the Laravel Cloud secrets BACKUP_S3_KEY / BACKUP_S3_SECRET."
         else
-            "${doctl[@]}" spaces keys delete "$(key_field access_key)" --force >/dev/null 2>&1 || true
-            if [ -n "${key_id}" ]; then
-                cloud secret:delete "${key_id}" --no-interaction >/dev/null 2>&1 || true
-            fi
-            fail "could not store the database key in Laravel Cloud, so the key was deleted again. Run this again."
+            # Undo by name: a create can succeed without its id being read back.
+            local access left="" now secret_name stray
+            access="$(key_field access_key)"
+            delete_spaces_key "${access}" || left="${left}
+  ${doctl[*]} spaces keys delete ${access}"
+            now="$(cloud secret:list --json 2>/dev/null || echo '[]')"
+            for secret_name in BACKUP_S3_KEY BACKUP_S3_SECRET; do
+                for stray in $(jq -r --arg name "${secret_name}" '.[]? | select(.key == $name) | .id | tostring' <<<"${now}" 2>/dev/null || true); do
+                    cloud secret:delete "${stray}" --force --no-interaction >/dev/null 2>&1 || left="${left}
+  cloud secret:delete ${stray} --force     (${secret_name})"
+                done
+            done
+            [ -z "${left}" ] || fail "could not store the database key in Laravel Cloud, nor fully undo it. Run these, then run this again:${left}"
+            fail "could not store the database key in Laravel Cloud; the key and any secret made for it were deleted again. Run this again."
         fi
         rm -f "${work}/key.json"
     fi
@@ -471,8 +529,18 @@ setup_digitalocean() {
         return
     fi
 
-    # Spaces accepts the us-east-1 signing region for every region; the
-    # endpoint picks the real one.
+    # Check gh before making any key, so a missing sign-in fails early.
+    local repository
+    repository="$(field .github_repository "")"
+    if [ -n "${repository}" ] && ! ${plan}; then
+        require gh
+        gh secret list -R "${repository}" >/dev/null \
+            || fail "gh cannot list the secrets of ${repository}; sign in (gh auth login) as someone who can set them."
+    fi
+
+    # DigitalOcean's docs: sign as us-east-1 when creating a Space (any other
+    # value is sent as a location constraint); the endpoint picks the real
+    # region. Apps using an existing Space may sign with its own region.
     s3api=(aws --endpoint-url "${endpoint}" --region us-east-1 s3api)
 
     if ${plan}; then
@@ -481,7 +549,8 @@ setup_digitalocean() {
         # Only this process uses the temporary key; no profile or session
         # token may override it.
         unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN
-        create_spaces_key "setup-bucket-temporary-$(date +%Y%m%d%H%M%S)" "bucket=;permission=fullaccess"
+        temp_name="setup-bucket-temporary-$(date +%Y%m%d%H%M%S)-$$"
+        create_spaces_key "${temp_name}" "bucket=;permission=fullaccess"
         temp_key="$(key_field access_key)"
         export AWS_ACCESS_KEY_ID="${temp_key}"
         AWS_SECRET_ACCESS_KEY="$(key_field secret_key)"
@@ -498,6 +567,8 @@ setup_digitalocean() {
     fi
 
     configure_bucket
+    # The temporary key's job is done; nothing after this needs it.
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     setup_sync_key
 
     cat <<EOF

@@ -267,7 +267,7 @@ configure_bucket() {
 
     if run "${s3api[@]}" put-bucket-lifecycle-configuration --bucket "${bucket}" \
         --lifecycle-configuration "file://${rules}"; then
-        echo "Retention rules applied."
+        ${plan} || echo "Retention rules applied."
     else
         echo "The provider rejected the full rule set; retrying without the rules for previous versions and delete markers." >&2
         lifecycle_json basic >"${rules}"
@@ -577,8 +577,11 @@ Next:
   1. In buckets.yml's destination, set
        endpoint: ${endpoint}
        provider: DigitalOcean
-  2. After deploying cloud-db-backup to Laravel Cloud, give it the database key:
-       $0 ${config} --db-key <environment id>
+  2. After deploying cloud-db-backup to Laravel Cloud, give it the database key.
+     From a config repository made from the template:
+       aws/deploy.sh --db-key <environment id>
+     Or with this script directly:
+       aws/setup-bucket <stack.json> --db-key <environment id>
   Spaces keys that can write can also delete, so treat both keys as able to
   remove backups.
 EOF

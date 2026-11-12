@@ -68,11 +68,34 @@ a leaked key could overwrite backups, but not beyond recovery within that window
 Any S3-compatible bucket. **AWS S3** gets the full setup from a CloudFormation
 template: an upload-only IAM user (it can write dumps but not read or delete them)
 and a GitHub OIDC role for the storage sync, so no AWS key is stored in GitHub.
-**Other providers** (DigitalOcean Spaces, Backblaze B2, MinIO, ...) get the same
-bucket, versioning and retention rules through the S3 API; their access keys
-are created in the provider's console and can usually delete as well as write.
+**DigitalOcean Spaces** gets the same bucket, versioning and retention rules
+through the S3 API, and its access keys are made with `doctl` and stored
+straight into GitHub and Laravel Cloud, so there are no console steps and no key
+is ever displayed. **Other providers** (Backblaze B2, MinIO, ...) get the same
+bucket rules; their access keys are created in the provider's console. Outside
+AWS a key that can write can usually also delete.
 
 ## Setup
+
+### Tools
+
+On the machine you run the setup from (macOS or Linux):
+
+| Tool | Needed for | Install (macOS) |
+|---|---|---|
+| `bash`, `curl` | everything | built in |
+| `jq` | `aws/setup-bucket` | `brew install jq` |
+| AWS CLI (`aws`) | `aws/setup-bucket`, every provider (it speaks the S3 API, also to Spaces) | `brew install awscli` |
+| `doctl` | provider `digitalocean` | `brew install doctl` |
+| GitHub CLI (`gh`) | provider `digitalocean` (stores the storage sync's key); `aws` (detects the OIDC subject format) | `brew install gh` |
+| Laravel Cloud CLI (`cloud`) | provider `digitalocean` with `--db-key`; reading cluster details | see [the Cloud docs](https://cloud.laravel.com/docs) |
+| `age` | making the encryption key pair, and restoring | `brew install age` |
+
+Sign each one in to the **organization being set up**: `aws` with a profile for
+its AWS account; `doctl auth init --context <name>` with an API token from its
+DigitalOcean team (it needs to create, read and delete Spaces keys); `gh auth
+login` as someone who can set secrets on its config repository; `cloud auth`
+in its Laravel Cloud organization.
 
 ### 1. The bucket (once per account)
 
@@ -92,9 +115,19 @@ repository, next to the storage sync's `buckets.yml`):
 
 ```json
 {
-  "provider": "s3-compatible",
-  "endpoint": "https://blr1.digitaloceanspaces.com",
+  "provider": "digitalocean",
   "region": "blr1",
+  "bucket": "client-offsite-backups",
+  "doctl_context": "client",
+  "github_repository": "client/cloud-backups"
+}
+```
+
+```json
+{
+  "provider": "s3-compatible",
+  "endpoint": "https://s3.eu-central-003.backblazeb2.com",
+  "region": "eu-central-003",
   "bucket": "client-offsite-backups"
 }
 ```
@@ -109,24 +142,53 @@ aws/setup-bucket stack.json
 
 | `stack.json` field | Default | |
 |---|---|---|
-| `provider` | — | `aws` or `s3-compatible`. |
-| `region` | — | |
-| `bucket` | — | Globally unique on AWS. |
-| `endpoint` | — | `s3-compatible` only: the provider's S3 endpoint. |
+| `provider` | — | `aws`, `digitalocean` or `s3-compatible`. |
+| `region` | — | e.g. `ap-south-1`; for Spaces `blr1`, `nyc3`, ... |
+| `bucket` | — | Globally unique on AWS and on Spaces. |
+| `endpoint` | `https://<region>.digitaloceanspaces.com` on `digitalocean` | `s3-compatible`: required, the provider's S3 endpoint. |
+| `doctl_context` | the current one | `digitalocean` only: the `doctl auth` context signed in to the right team. |
 | `retention.daily_days` | 35 | Days each daily dump is kept. |
 | `retention.monthly_days` | 365 | Days each monthly dump and run manifest is kept. |
 | `retention.noncurrent_file_version_days` | 90 | Days a mirrored file's previous version is kept. |
 | `retention.dump_version_recovery_days` | 7 | Days a replaced or expired dump is kept as a previous version. |
 | `stack_name` | `offsite-backups` | `aws` only. |
-| `github_repository` | empty | `aws` only: `owner/repo` allowed to run the storage sync. Empty skips that role. |
+| `github_repository` | empty | `aws`: `owner/repo` allowed to run the storage sync; empty skips that role. `digitalocean`: the repository whose `DESTINATION_*` secrets get the storage sync's key; empty skips that key. |
 | `github_branch` | `main` | `aws` only. |
 | `github_subject_prefix` | detected | `aws` only. Set when the repository uses GitHub's immutable OIDC subject format (`repo:owner@id/name@id`, the default for new repositories). With `gh` installed, `setup-bucket` detects it. |
 | `create_github_oidc_provider` | `true` | `aws` only. `false` if the account already has GitHub's OIDC provider. |
 
 On AWS it deploys [`aws/backup-bucket.yml`](aws/backup-bucket.yml) with your
-AWS CLI profile. For other providers it uses `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY` set to that provider's keys; if the provider rejects
-part of the retention rules, it applies what it can and says what is missing.
+AWS CLI profile. For `s3-compatible` it uses `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` set to that provider's keys. Outside AWS, if the
+provider rejects part of the retention rules, it applies what it can and says
+what is missing.
+
+On `digitalocean`, DigitalOcean's API (and so `doctl`) manages Spaces keys but
+not buckets, so the script:
+
+1. creates a temporary full-access Spaces key with `doctl`, which it deletes
+   again when it exits, however it exits;
+2. with that key and the AWS CLI, creates the bucket, turns versioning on and
+   applies the retention rules;
+3. creates the storage sync's key, `<bucket>-storage-sync`, limited to this
+   bucket, and stores it as `github_repository`'s `DESTINATION_ACCESS_KEY_ID`
+   and `DESTINATION_SECRET_ACCESS_KEY` secrets with `gh`.
+
+Once a deployment exists (step 3 below), give it the database key:
+
+```bash
+aws/setup-bucket stack.json --db-key <environment id>
+```
+
+The first time, this creates `<bucket>-db-backup`, limited to this bucket, and
+stores it as the Laravel Cloud organization secrets `BACKUP_S3_KEY` and
+`BACKUP_S3_SECRET`; every time, it attaches them to that environment. Run it
+once per deployment.
+
+Keys are piped from one tool to the next and never displayed. A key's secret
+cannot be read back later, so a re-run reuses a key only when its secrets are
+already stored; if one exists without the other, the script says which to
+delete before running it again. Spaces keys that can write can also delete.
 
 Either way the bucket is versioned and encrypted at rest, and has **no Object
 Lock**: an account administrator can delete anything in it. On AWS everything

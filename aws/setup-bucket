@@ -3,34 +3,62 @@
 # Creates or updates the offsite backup bucket described by a stack.json.
 #
 #   setup-bucket <stack.json> [--plan]
+#   setup-bucket <stack.json> --db-key <environment> [--plan]   (digitalocean only)
 #
 # provider "aws"            Deploys backup-bucket.yml with CloudFormation: the
 #                           bucket, its lifecycle rules, the upload-only IAM user
 #                           and the GitHub OIDC role. Uses your AWS CLI profile.
 #
-# provider "s3-compatible"  Any other S3-compatible service (DigitalOcean Spaces,
-#                           Backblaze B2, MinIO, ...). Creates the bucket if it is
-#                           missing, turns versioning on and applies the same
-#                           retention rules through the S3 API. Uses
-#                           AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY set to that
-#                           provider's keys. Access keys are created in the
-#                           provider's own console.
+# provider "digitalocean"   DigitalOcean Spaces, with no console steps. doctl
+#                           creates a temporary full-access Spaces key for the
+#                           bucket setup (deleted again when the script exits),
+#                           the bucket gets the same versioning and retention
+#                           rules as "s3-compatible", and then doctl creates the
+#                           storage sync's key, limited to this bucket, which gh
+#                           stores as github_repository's DESTINATION_* secrets.
+#                           --db-key <environment> creates the database apps'
+#                           key, stores it as the Laravel Cloud secrets
+#                           BACKUP_S3_KEY / BACKUP_S3_SECRET and attaches them to
+#                           that environment. No key is ever printed.
+#
+# provider "s3-compatible"  Any other S3-compatible service (Backblaze B2,
+#                           MinIO, ...). Creates the bucket if it is missing,
+#                           turns versioning on and applies the same retention
+#                           rules through the S3 API. Uses AWS_ACCESS_KEY_ID /
+#                           AWS_SECRET_ACCESS_KEY set to that provider's keys.
+#                           Access keys are created in the provider's console.
 #
 # --plan prints what would run and changes nothing.
 #
-# Needs: bash, jq, and the AWS CLI. Written for bash 3.2, so it runs on macOS.
+# Needs: bash, jq and the AWS CLI. "digitalocean" also needs doctl, gh (for the
+# storage sync's key) and, for --db-key, the Laravel Cloud CLI (cloud). Written
+# for bash 3.2, so it runs on macOS.
 
 set -euo pipefail
 
 usage() {
     echo "usage: $0 <stack.json> [--plan]" >&2
+    echo "       $0 <stack.json> --db-key <environment> [--plan]   (provider \"digitalocean\")" >&2
     exit 2
 }
 
 [ $# -ge 1 ] || usage
 config="$1"
+shift
 plan=false
-[ "${2:-}" = "--plan" ] && plan=true
+db_key_environment=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --plan) plan=true ;;
+        --db-key)
+            { [ $# -ge 2 ] && [ -n "$2" ]; } || usage
+            db_key_environment="$2"
+            shift
+            ;;
+        *) usage ;;
+    esac
+    shift
+done
 [ -f "${config}" ] || { echo "setup-bucket: ${config} not found" >&2; exit 2; }
 
 for tool in jq aws; do
@@ -38,6 +66,24 @@ for tool in jq aws; do
 done
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Temporary files, and the temporary Spaces key if one was made, are removed
+# however the script exits.
+work="$(mktemp -d)"
+doctl=(doctl)
+temp_key=""
+cleanup() {
+    rm -rf "${work}"
+    if [ -n "${temp_key}" ]; then
+        if "${doctl[@]}" spaces keys delete "${temp_key}" --force >/dev/null 2>&1; then
+            echo "Temporary Spaces key deleted."
+        else
+            echo "WARNING: could not delete the temporary full-access Spaces key ${temp_key}. Delete it now:" >&2
+            echo "         ${doctl[*]} spaces keys delete ${temp_key}" >&2
+        fi
+    fi
+}
+trap cleanup EXIT
 
 field() {
     # field <jq path> <default>. Only a missing or null value takes the
@@ -57,6 +103,13 @@ dump_recovery_days="$(field .retention.dump_version_recovery_days 7)"
 fail() {
     echo "setup-bucket: $*" >&2
     exit 1
+}
+
+require() {
+    local tool
+    for tool in "$@"; do
+        command -v "${tool}" >/dev/null || fail "${tool} is required for provider \"${provider}\""
+    done
 }
 
 [ -n "${bucket}" ] || fail "\"bucket\" is required"
@@ -180,13 +233,9 @@ Next:
 EOF
 }
 
-setup_s3_compatible() {
-    [ -n "${endpoint}" ] || fail "\"endpoint\" is required for provider \"s3-compatible\""
-
-    local s3api=(aws --endpoint-url "${endpoint}" --region "${region}" s3api)
-
-    echo "Setting up bucket ${bucket} at ${endpoint}."
-
+# configure_bucket: creates the bucket if it is missing, turns versioning on
+# and applies the retention rules, all through "${s3api[@]}".
+configure_bucket() {
     if ${plan}; then
         run "${s3api[@]}" create-bucket --bucket "${bucket}"
     elif "${s3api[@]}" head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
@@ -201,9 +250,7 @@ setup_s3_compatible() {
         echo "WARNING: the provider refused versioning. Files deleted or replaced in a source bucket will not be recoverable from the mirror." >&2
     fi
 
-    local rules
-    rules="$(mktemp)"
-    trap 'rm -f "${rules}"' RETURN
+    local rules="${work}/lifecycle.json"
 
     lifecycle_json full >"${rules}"
     ${plan} && { echo "Lifecycle rules:"; cat "${rules}"; }
@@ -220,6 +267,15 @@ setup_s3_compatible() {
         echo "         replaced or deleted mirrored files are then kept as previous versions until you delete them, and keep" >&2
         echo "         costing storage. Set a rule for noncurrent versions in the provider's console if it offers one." >&2
     fi
+}
+
+setup_s3_compatible() {
+    [ -n "${endpoint}" ] || fail "\"endpoint\" is required for provider \"s3-compatible\""
+
+    s3api=(aws --endpoint-url "${endpoint}" --region "${region}" s3api)
+
+    echo "Setting up bucket ${bucket} at ${endpoint}."
+    configure_bucket
 
     cat <<EOF
 
@@ -233,8 +289,237 @@ Next (in the provider's console):
 EOF
 }
 
+# ---------------------------------------------------------------------------
+# DigitalOcean Spaces
+#
+# DigitalOcean's API, and so doctl, manages Spaces access keys but not buckets:
+# a bucket's versioning and lifecycle rules exist only in the S3 API. So doctl
+# makes the keys and the AWS CLI configures the bucket with one of them.
+# A Spaces key is either full-access (every bucket in the team) or limited to
+# named buckets with "read" or "readwrite"; readwrite can also delete.
+
+# spaces_key_access <name>: the access key id of the Spaces key with that
+# name, or nothing.
+spaces_key_access() {
+    local keys
+    keys="$("${doctl[@]}" spaces keys list -o json)" || fail "doctl could not list Spaces keys"
+    jq -r --arg name "$1" 'if type == "array" then . else [] end | map(select(.name == $name)) | .[0].access_key // empty' <<<"${keys}"
+}
+
+# create_spaces_key <name> <grants>: creates the key and leaves its id and
+# secret in ${work}/key.json, readable only by this user.
+create_spaces_key() {
+    (umask 077 && "${doctl[@]}" spaces keys create "$1" --grants "$2" -o json \
+        | jq 'if type == "array" then .[0] else . end | {access_key, secret_key}' >"${work}/key.json") \
+        || fail "doctl could not create the Spaces key \"$1\""
+    [ -n "$(jq -r '.access_key // empty' "${work}/key.json")" ] && [ -n "$(jq -r '.secret_key // empty' "${work}/key.json")" ] \
+        || fail "doctl did not return the new Spaces key \"$1\""
+}
+
+key_field() {
+    jq -j ".$1" "${work}/key.json"
+}
+
+# The storage sync's key, stored as secrets of github_repository.
+setup_sync_key() {
+    local name="${bucket}-storage-sync"
+    local repository
+    repository="$(field .github_repository "")"
+
+    if [ -z "${repository}" ]; then
+        echo "No github_repository in stack.json: skipping the storage sync's key."
+        return
+    fi
+    require gh
+
+    if ${plan}; then
+        echo "Storage sync key \"${name}\" (readwrite on ${bucket}), stored in ${repository}:"
+        run "${doctl[@]}" spaces keys create "${name}" --grants "bucket=${bucket};permission=readwrite"
+        run gh secret set DESTINATION_ACCESS_KEY_ID -R "${repository}"
+        run gh secret set DESTINATION_SECRET_ACCESS_KEY -R "${repository}"
+        return
+    fi
+
+    local existing secrets secret in_github=0
+    existing="$(spaces_key_access "${name}")"
+    secrets="$(gh secret list -R "${repository}" --json name --jq '.[].name')" \
+        || fail "gh cannot list the secrets of ${repository}"
+    for secret in DESTINATION_ACCESS_KEY_ID DESTINATION_SECRET_ACCESS_KEY; do
+        if grep -qx "${secret}" <<<"${secrets}"; then
+            in_github=$((in_github + 1))
+        fi
+    done
+
+    if [ -n "${existing}" ] && [ "${in_github}" -eq 2 ]; then
+        echo "Storage sync key \"${name}\" exists and ${repository} has its secrets."
+        return
+    fi
+    if [ -n "${existing}" ]; then
+        fail "Spaces key \"${name}\" exists but ${repository} lacks its DESTINATION_* secrets, and a key's secret cannot be read back. Delete the key (${doctl[*]} spaces keys delete ${existing}) and run this again."
+    fi
+    if [ "${in_github}" -gt 0 ]; then
+        fail "${repository} already has DESTINATION_* secrets but there is no Spaces key \"${name}\": they hold some other key. Delete them (gh secret delete <name> -R ${repository}) and run this again."
+    fi
+
+    create_spaces_key "${name}" "bucket=${bucket};permission=readwrite"
+    if key_field access_key | gh secret set DESTINATION_ACCESS_KEY_ID -R "${repository}" >/dev/null \
+        && key_field secret_key | gh secret set DESTINATION_SECRET_ACCESS_KEY -R "${repository}" >/dev/null; then
+        echo "Storage sync key \"${name}\" created and stored as ${repository}'s DESTINATION_* secrets."
+    else
+        "${doctl[@]}" spaces keys delete "$(key_field access_key)" --force >/dev/null 2>&1 || true
+        gh secret delete DESTINATION_ACCESS_KEY_ID -R "${repository}" >/dev/null 2>&1 || true
+        fail "could not store the storage sync key in ${repository}, so the key was deleted again. Check gh's access and run this again."
+    fi
+    rm -f "${work}/key.json"
+}
+
+# cloud_secret_id <secrets json> <name>
+cloud_secret_id() {
+    jq -r --arg name "$2" '[.[]? | select(.key == $name)] | .[0].id // empty | tostring' <<<"$1"
+}
+
+# The database apps' key: one per bucket, shared by every cloud-db-backup
+# deployment in the organization. Laravel Cloud secrets belong to the
+# organization and are attached to environments.
+setup_db_key() {
+    local environment="$1"
+    local name="${bucket}-db-backup"
+    require cloud
+
+    if ${plan}; then
+        echo "Database key \"${name}\" (readwrite on ${bucket}), stored in Laravel Cloud and attached to ${environment}:"
+        run "${doctl[@]}" spaces keys create "${name}" --grants "bucket=${bucket};permission=readwrite"
+        run cloud secret:create --name BACKUP_S3_KEY --json
+        run cloud secret:create --name BACKUP_S3_SECRET --json
+        run cloud environment-secret:attach "${environment}" '<BACKUP_S3_KEY id>' '<BACKUP_S3_SECRET id>'
+        return
+    fi
+
+    local existing secrets key_id secret_id
+    existing="$(spaces_key_access "${name}")"
+    secrets="$(cloud secret:list --json)" || fail "cannot list Laravel Cloud secrets; is cloud signed in to the right organization?"
+    key_id="$(cloud_secret_id "${secrets}" BACKUP_S3_KEY)"
+    secret_id="$(cloud_secret_id "${secrets}" BACKUP_S3_SECRET)"
+
+    if [ -n "${key_id}" ] && [ -n "${secret_id}" ]; then
+        [ -n "${existing}" ] || fail "Laravel Cloud already has BACKUP_S3_KEY / BACKUP_S3_SECRET but there is no Spaces key \"${name}\": they hold some other key. Delete them (cloud secret:delete <id>) and run this again."
+        echo "Database key \"${name}\" exists and Laravel Cloud has its secrets."
+    elif [ -n "${key_id}" ] || [ -n "${secret_id}" ]; then
+        fail "Laravel Cloud has only one of BACKUP_S3_KEY / BACKUP_S3_SECRET. Delete it (cloud secret:delete <id>) and run this again."
+    else
+        [ -z "${existing}" ] || fail "Spaces key \"${name}\" exists but Laravel Cloud lacks its secrets, and a key's secret cannot be read back. Delete the key (${doctl[*]} spaces keys delete ${existing}) and run this again."
+
+        create_spaces_key "${name}" "bucket=${bucket};permission=readwrite"
+        local note="Spaces key ${name}, limited to bucket ${bucket}; for cloud-db-backup. Made by setup-bucket."
+        if key_id="$(key_field access_key | cloud secret:create --name BACKUP_S3_KEY --notes "${note}" --json --no-interaction | jq -r '.id // empty | tostring')" \
+            && [ -n "${key_id}" ] \
+            && secret_id="$(key_field secret_key | cloud secret:create --name BACKUP_S3_SECRET --notes "${note}" --json --no-interaction | jq -r '.id // empty | tostring')" \
+            && [ -n "${secret_id}" ]; then
+            echo "Database key \"${name}\" created and stored as the Laravel Cloud secrets BACKUP_S3_KEY / BACKUP_S3_SECRET."
+        else
+            "${doctl[@]}" spaces keys delete "$(key_field access_key)" --force >/dev/null 2>&1 || true
+            if [ -n "${key_id}" ]; then
+                cloud secret:delete "${key_id}" --no-interaction >/dev/null 2>&1 || true
+            fi
+            fail "could not store the database key in Laravel Cloud, so the key was deleted again. Run this again."
+        fi
+        rm -f "${work}/key.json"
+    fi
+
+    local attached id missing=()
+    attached="$(cloud environment-secret:list "${environment}" --json)" || fail "cannot read the secrets of environment ${environment}"
+    for id in "${key_id}" "${secret_id}"; do
+        if ! jq -e --arg id "${id}" 'any(.[]?; (.id | tostring) == $id)' <<<"${attached}" >/dev/null; then
+            missing+=("${id}")
+        fi
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        cloud environment-secret:attach "${environment}" "${missing[@]}" --no-interaction >/dev/null \
+            || fail "could not attach the secrets to environment ${environment}"
+        echo "Secrets attached to environment ${environment}."
+    else
+        echo "Secrets already attached to environment ${environment}."
+    fi
+
+    cat <<EOF
+
+Next, on environment ${environment}, set these variables, then deploy it
+(variables and secrets apply on deploy):
+  BACKUP_S3_BUCKET=${bucket}
+  BACKUP_S3_REGION=${region}
+  BACKUP_S3_ENDPOINT=${endpoint}
+  BACKUP_S3_STORAGE_CLASS=       (empty: Spaces has no storage classes)
+EOF
+}
+
+setup_digitalocean() {
+    require doctl
+
+    local context
+    context="$(field .doctl_context "")"
+    [ -z "${context}" ] || doctl+=(--context "${context}")
+    [ -n "${endpoint}" ] || endpoint="https://${region}.digitaloceanspaces.com"
+
+    echo "DigitalOcean (doctl context: ${context:-current}): bucket ${bucket} at ${endpoint}."
+    if ! ${plan}; then
+        "${doctl[@]}" spaces keys list -o json >/dev/null 2>&1 \
+            || fail "doctl cannot list Spaces keys. Sign in with: doctl auth init${context:+ --context ${context}}, using a token from the team that should own the backups."
+    fi
+
+    if [ -n "${db_key_environment}" ]; then
+        setup_db_key "${db_key_environment}"
+        return
+    fi
+
+    # Spaces accepts the us-east-1 signing region for every region; the
+    # endpoint picks the real one.
+    s3api=(aws --endpoint-url "${endpoint}" --region us-east-1 s3api)
+
+    if ${plan}; then
+        run "${doctl[@]}" spaces keys create setup-bucket-temporary --grants "bucket=;permission=fullaccess"
+    else
+        # Only this process uses the temporary key; no profile or session
+        # token may override it.
+        unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN
+        create_spaces_key "setup-bucket-temporary-$(date +%Y%m%d%H%M%S)" "bucket=;permission=fullaccess"
+        temp_key="$(key_field access_key)"
+        export AWS_ACCESS_KEY_ID="${temp_key}"
+        AWS_SECRET_ACCESS_KEY="$(key_field secret_key)"
+        export AWS_SECRET_ACCESS_KEY
+        rm -f "${work}/key.json"
+
+        # A new key can take a few seconds to be accepted.
+        local tries=0
+        until "${s3api[@]}" list-buckets >/dev/null 2>&1; do
+            tries=$((tries + 1))
+            [ "${tries}" -lt 30 ] || fail "the temporary Spaces key was not accepted at ${endpoint} within a minute"
+            sleep 2
+        done
+    fi
+
+    configure_bucket
+    setup_sync_key
+
+    cat <<EOF
+
+Next:
+  1. In buckets.yml's destination, set
+       endpoint: ${endpoint}
+       provider: DigitalOcean
+  2. After deploying cloud-db-backup to Laravel Cloud, give it the database key:
+       $0 ${config} --db-key <environment id>
+  Spaces keys that can write can also delete, so treat both keys as able to
+  remove backups.
+EOF
+}
+
+if [ -n "${db_key_environment}" ] && [ "${provider}" != "digitalocean" ]; then
+    fail "--db-key is only for provider \"digitalocean\""
+fi
+
 case "${provider}" in
     aws) setup_aws ;;
     s3-compatible) setup_s3_compatible ;;
-    *) fail "\"provider\" must be \"aws\" or \"s3-compatible\" (got \"${provider}\")" ;;
+    digitalocean) setup_digitalocean ;;
+    *) fail "\"provider\" must be \"aws\", \"digitalocean\" or \"s3-compatible\" (got \"${provider}\")" ;;
 esac

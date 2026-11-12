@@ -167,9 +167,9 @@ On `digitalocean`, DigitalOcean's API (and so `doctl`) manages Spaces keys but
 not buckets, so the script:
 
 1. creates a temporary full-access Spaces key with `doctl`, and deletes it when
-   it exits, on success or failure (if that delete fails, or the script is
-   killed outright, it prints, or you run, `doctl spaces keys list` to find
-   the `setup-bucket-temporary-…` key and delete it);
+   it exits, on success or failure. If that delete fails it prints the command
+   to run; if the script is killed outright, find the `setup-bucket-temporary-…`
+   key with `doctl spaces keys list` and delete it;
 2. with that key and the AWS CLI, creates the bucket, turns versioning on and
    applies the retention rules;
 3. creates the storage sync's key, `<bucket>-storage-sync`, limited to this
